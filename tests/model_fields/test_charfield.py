@@ -3,7 +3,6 @@ from unittest import skipIf
 from django.core.exceptions import ValidationError
 from django.db import connection, models
 from django.test import SimpleTestCase, TestCase
-from django.utils.functional import lazy
 
 from .models import Post
 
@@ -29,8 +28,26 @@ class TestCharField(TestCase):
         p.refresh_from_db()
         self.assertEqual(p.title, 'Smile 😀')
 
+    def test_assignment_from_choice_enum(self):
+        class Event(models.TextChoices):
+            C = 'Carnival!'
+            F = 'Festival!'
+
+        p1 = Post.objects.create(title=Event.C, body=Event.F)
+        p1.refresh_from_db()
+        self.assertEqual(p1.title, 'Carnival!')
+        self.assertEqual(p1.body, 'Festival!')
+        self.assertEqual(p1.title, Event.C)
+        self.assertEqual(p1.body, Event.F)
+        p2 = Post.objects.get(title='Carnival!')
+        self.assertEqual(p1, p2)
+        self.assertEqual(p2.title, Event.C)
+
 
 class ValidationTests(SimpleTestCase):
+
+    class Choices(models.TextChoices):
+        C = 'c', 'C'
 
     def test_charfield_raises_error_on_empty_string(self):
         f = models.CharField()
@@ -50,16 +67,14 @@ class ValidationTests(SimpleTestCase):
         with self.assertRaises(ValidationError):
             f.clean('not a', None)
 
-    def test_charfield_get_choices_with_blank_defined(self):
-        f = models.CharField(choices=[('', '<><>'), ('a', 'A')])
-        self.assertEqual(f.get_choices(True), [('', '<><>'), ('a', 'A')])
+    def test_enum_choices_cleans_valid_string(self):
+        f = models.CharField(choices=self.Choices.choices, max_length=1)
+        self.assertEqual(f.clean('c', None), 'c')
 
-    def test_charfield_get_choices_doesnt_evaluate_lazy_strings(self):
-        # Regression test for #23098
-        # Will raise ZeroDivisionError if lazy is evaluated
-        lazy_func = lazy(lambda x: 0 / 0, int)
-        f = models.CharField(choices=[(lazy_func('group'), (('a', 'A'), ('b', 'B')))])
-        self.assertEqual(f.get_choices(True)[0], ('', '---------'))
+    def test_enum_choices_invalid_input(self):
+        f = models.CharField(choices=self.Choices.choices, max_length=1)
+        with self.assertRaises(ValidationError):
+            f.clean('a', None)
 
     def test_charfield_raises_error_on_empty_input(self):
         f = models.CharField(null=False)

@@ -7,6 +7,7 @@ from django.core import exceptions
 from django.db.models import (
     Field, TextField, Transform, lookups as builtin_lookups,
 )
+from django.db.models.fields.mixins import CheckFieldDefaultMixin
 from django.utils.translation import gettext_lazy as _
 
 __all__ = ['JSONField']
@@ -25,12 +26,13 @@ class JsonAdapter(Json):
         return json.dumps(obj, **options)
 
 
-class JSONField(Field):
+class JSONField(CheckFieldDefaultMixin, Field):
     empty_strings_allowed = False
     description = _('A JSON object')
     default_error_messages = {
         'invalid': _("Value must be valid JSON."),
     }
+    _default_hint = ('dict', '{}')
 
     def __init__(self, verbose_name=None, name=None, encoder=None, **kwargs):
         if encoder and not callable(encoder):
@@ -74,9 +76,10 @@ class JSONField(Field):
         return self.value_from_object(obj)
 
     def formfield(self, **kwargs):
-        defaults = {'form_class': forms.JSONField}
-        defaults.update(kwargs)
-        return super().formfield(**defaults)
+        return super().formfield(**{
+            'form_class': forms.JSONField,
+            **kwargs,
+        })
 
 
 JSONField.register_lookup(lookups.DataContains)
@@ -84,6 +87,7 @@ JSONField.register_lookup(lookups.ContainedBy)
 JSONField.register_lookup(lookups.HasKey)
 JSONField.register_lookup(lookups.HasKeys)
 JSONField.register_lookup(lookups.HasAnyKeys)
+JSONField.register_lookup(lookups.JSONExact)
 
 
 class KeyTransform(Transform):
@@ -102,20 +106,18 @@ class KeyTransform(Transform):
             previous = previous.lhs
         lhs, params = compiler.compile(previous)
         if len(key_transforms) > 1:
-            return "(%s %s %%s)" % (lhs, self.nested_operator), [key_transforms] + params
+            return '(%s %s %%s)' % (lhs, self.nested_operator), params + [key_transforms]
         try:
-            int(self.key_name)
+            lookup = int(self.key_name)
         except ValueError:
-            lookup = "'%s'" % self.key_name
-        else:
-            lookup = "%s" % self.key_name
-        return "(%s %s %s)" % (lhs, self.operator, lookup), params
+            lookup = self.key_name
+        return '(%s %s %%s)' % (lhs, self.operator), tuple(params) + (lookup,)
 
 
 class KeyTextTransform(KeyTransform):
     operator = '->>'
     nested_operator = '#>>'
-    _output_field = TextField()
+    output_field = TextField()
 
 
 class KeyTransformTextLookupMixin:

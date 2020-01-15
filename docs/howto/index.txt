@@ -20,10 +20,10 @@ you quickly accomplish common tasks.
    upgrade-version
    error-reporting
    initial-data
-   jython
    legacy-databases
    outputting-csv
    outputting-pdf
+   overriding-templates
    static-files/index
    static-files/deployment
    windows

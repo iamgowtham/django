@@ -1,4 +1,3 @@
-import collections
 import logging
 import re
 import sys
@@ -7,6 +6,7 @@ import warnings
 from contextlib import contextmanager
 from functools import wraps
 from io import StringIO
+from itertools import chain
 from types import SimpleNamespace
 from unittest import TestCase, skipIf, skipUnless
 from xml.dom.minidom import Node, parseString
@@ -49,9 +49,7 @@ class Approximate:
         return repr(self.val)
 
     def __eq__(self, other):
-        if self.val == other:
-            return True
-        return round(abs(self.val - other), self.places) == 0
+        return self.val == other or round(abs(self.val - other), self.places) == 0
 
 
 class ContextList(list):
@@ -85,11 +83,7 @@ class ContextList(list):
         """
         Flattened keys of subcontexts.
         """
-        keys = set()
-        for subcontext in self:
-            for dict in subcontext:
-                keys |= set(dict.keys())
-        return keys
+        return set(chain.from_iterable(d for subcontext in self for d in subcontext))
 
 
 def instrumented_test_render(self, context):
@@ -125,7 +119,7 @@ def setup_test_environment(debug=None):
 
     saved_data.allowed_hosts = settings.ALLOWED_HOSTS
     # Add the default host of the test client.
-    settings.ALLOWED_HOSTS = list(settings.ALLOWED_HOSTS) + ['testserver']
+    settings.ALLOWED_HOSTS = [*settings.ALLOWED_HOSTS, 'testserver']
 
     saved_data.debug = settings.DEBUG
     settings.DEBUG = debug
@@ -157,13 +151,13 @@ def teardown_test_environment():
     del mail.outbox
 
 
-def setup_databases(verbosity, interactive, keepdb=False, debug_sql=False, parallel=0, **kwargs):
+def setup_databases(verbosity, interactive, keepdb=False, debug_sql=False, parallel=0, aliases=None, **kwargs):
     """Create the test databases."""
-    test_databases, mirrored_aliases = get_unique_databases_and_mirrors()
+    test_databases, mirrored_aliases = get_unique_databases_and_mirrors(aliases)
 
     old_names = []
 
-    for signature, (db_name, aliases) in test_databases.items():
+    for db_name, aliases in test_databases.values():
         first_alias = None
         for alias in aliases:
             connection = connections[alias]
@@ -176,12 +170,12 @@ def setup_databases(verbosity, interactive, keepdb=False, debug_sql=False, paral
                     verbosity=verbosity,
                     autoclobber=not interactive,
                     keepdb=keepdb,
-                    serialize=connection.settings_dict.get('TEST', {}).get('SERIALIZE', True),
+                    serialize=connection.settings_dict['TEST'].get('SERIALIZE', True),
                 )
                 if parallel > 1:
                     for index in range(parallel):
                         connection.creation.clone_test_db(
-                            number=index + 1,
+                            suffix=str(index + 1),
                             verbosity=verbosity,
                             keepdb=keepdb,
                         )
@@ -243,7 +237,7 @@ def dependency_ordered(test_databases, dependencies):
     return ordered_test_databases
 
 
-def get_unique_databases_and_mirrors():
+def get_unique_databases_and_mirrors(aliases=None):
     """
     Figure out which databases actually need to be created.
 
@@ -255,6 +249,8 @@ def get_unique_databases_and_mirrors():
                       where all aliases share the same underlying database.
     - mirrored_aliases: mapping of mirror aliases to original aliases.
     """
+    if aliases is None:
+        aliases = connections
     mirrored_aliases = {}
     test_databases = {}
     dependencies = {}
@@ -267,7 +263,7 @@ def get_unique_databases_and_mirrors():
         if test_settings['MIRROR']:
             # If the database is marked as a test mirror, save the alias.
             mirrored_aliases[alias] = test_settings['MIRROR']
-        else:
+        elif alias in aliases:
             # Store a tuple with DB parameters that uniquely identify it.
             # If we have two aliases with the same values for that tuple,
             # we only need to create the test database once.
@@ -283,8 +279,7 @@ def get_unique_databases_and_mirrors():
                 if alias != DEFAULT_DB_ALIAS and connection.creation.test_db_signature() != default_sig:
                     dependencies[alias] = test_settings.get('DEPENDENCIES', [DEFAULT_DB_ALIAS])
 
-    test_databases = dependency_ordered(test_databases.items(), dependencies)
-    test_databases = collections.OrderedDict(test_databases)
+    test_databases = dict(dependency_ordered(test_databases.items(), dependencies))
     return test_databases, mirrored_aliases
 
 
@@ -295,7 +290,7 @@ def teardown_databases(old_config, verbosity, parallel=0, keepdb=False):
             if parallel > 1:
                 for index in range(parallel):
                     connection.creation.destroy_test_db(
-                        number=index + 1,
+                        suffix=str(index + 1),
                         verbosity=verbosity,
                         keepdb=keepdb,
                     )
@@ -303,9 +298,7 @@ def teardown_databases(old_config, verbosity, parallel=0, keepdb=False):
 
 
 def get_runner(settings, test_runner_class=None):
-    if not test_runner_class:
-        test_runner_class = settings.TEST_RUNNER
-
+    test_runner_class = test_runner_class or settings.TEST_RUNNER
     test_path = test_runner_class.split('.')
     # Allow for relative paths
     if len(test_path) > 1:
@@ -313,8 +306,7 @@ def get_runner(settings, test_runner_class=None):
     else:
         test_module_name = '.'
     test_module = __import__(test_module_name, {}, {}, test_path[-1])
-    test_runner = getattr(test_module, test_path[-1])
-    return test_runner
+    return getattr(test_module, test_path[-1])
 
 
 class TestContextDecorator:
@@ -354,7 +346,11 @@ class TestContextDecorator:
                 context = self.enable()
                 if self.attr_name:
                     setattr(inner_self, self.attr_name, context)
-                decorated_setUp(inner_self)
+                try:
+                    decorated_setUp(inner_self)
+                except Exception:
+                    self.disable()
+                    raise
 
             def tearDown(inner_self):
                 decorated_tearDown(inner_self)
@@ -389,6 +385,8 @@ class override_settings(TestContextDecorator):
     with the ``with`` statement. In either event, entering/exiting are called
     before and after, respectively, the function/block is executed.
     """
+    enable_exception = None
+
     def __init__(self, **kwargs):
         self.options = kwargs
         super().__init__()
@@ -408,26 +406,45 @@ class override_settings(TestContextDecorator):
         self.wrapped = settings._wrapped
         settings._wrapped = override
         for key, new_value in self.options.items():
-            setting_changed.send(sender=settings._wrapped.__class__,
-                                 setting=key, value=new_value, enter=True)
+            try:
+                setting_changed.send(
+                    sender=settings._wrapped.__class__,
+                    setting=key, value=new_value, enter=True,
+                )
+            except Exception as exc:
+                self.enable_exception = exc
+                self.disable()
 
     def disable(self):
         if 'INSTALLED_APPS' in self.options:
             apps.unset_installed_apps()
         settings._wrapped = self.wrapped
         del self.wrapped
+        responses = []
         for key in self.options:
             new_value = getattr(settings, key, None)
-            setting_changed.send(sender=settings._wrapped.__class__,
-                                 setting=key, value=new_value, enter=False)
+            responses_for_setting = setting_changed.send_robust(
+                sender=settings._wrapped.__class__,
+                setting=key, value=new_value, enter=False,
+            )
+            responses.extend(responses_for_setting)
+        if self.enable_exception is not None:
+            exc = self.enable_exception
+            self.enable_exception = None
+            raise exc
+        for _, response in responses:
+            if isinstance(response, Exception):
+                raise response
 
     def save_options(self, test_func):
         if test_func._overridden_settings is None:
             test_func._overridden_settings = self.options
         else:
             # Duplicate dict to prevent subclasses from altering their parent.
-            test_func._overridden_settings = dict(
-                test_func._overridden_settings, **self.options)
+            test_func._overridden_settings = {
+                **test_func._overridden_settings,
+                **self.options,
+            }
 
     def decorate_class(self, cls):
         from django.test import SimpleTestCase
@@ -502,10 +519,14 @@ class override_system_checks(TestContextDecorator):
 
     def enable(self):
         self.old_checks = self.registry.registered_checks
-        self.registry.registered_checks = self.new_checks
+        self.registry.registered_checks = set()
+        for check in self.new_checks:
+            self.registry.register(check, *getattr(check, 'tags', ()))
         self.old_deployment_checks = self.registry.deployment_checks
         if self.deployment_checks is not None:
-            self.registry.deployment_checks = self.deployment_checks
+            self.registry.deployment_checks = set()
+            for check in self.deployment_checks:
+                self.registry.register(check, *getattr(check, 'tags', ()), deploy=True)
 
     def disable(self):
         self.registry.registered_checks = self.old_checks
@@ -516,7 +537,8 @@ def compare_xml(want, got):
     """
     Try to do a 'xml-comparison' of want and got. Plain string comparison
     doesn't always work because, for example, attribute ordering should not be
-    important. Ignore comment nodes and leading and trailing whitespace.
+    important. Ignore comment nodes, document type node, and leading and
+    trailing whitespaces.
 
     Based on https://github.com/lxml/lxml/blob/master/src/lxml/doctestcompare.py
     """
@@ -550,17 +572,13 @@ def compare_xml(want, got):
         got_children = children(got_element)
         if len(want_children) != len(got_children):
             return False
-        for want, got in zip(want_children, got_children):
-            if not check_element(want, got):
-                return False
-        return True
+        return all(check_element(want, got) for want, got in zip(want_children, got_children))
 
     def first_node(document):
         for node in document.childNodes:
-            if node.nodeType != Node.COMMENT_NODE:
+            if node.nodeType not in (Node.COMMENT_NODE, Node.DOCUMENT_TYPE_NODE):
                 return node
 
-    want, got = strip_quotes(want, got)
     want = want.strip().replace('\\n', '\n')
     got = got.strip().replace('\\n', '\n')
 
@@ -576,29 +594,6 @@ def compare_xml(want, got):
     got_root = first_node(parseString(got))
 
     return check_element(want_root, got_root)
-
-
-def strip_quotes(want, got):
-    """
-    Strip quotes of doctests output values:
-
-    >>> strip_quotes("'foo'")
-    "foo"
-    >>> strip_quotes('"foo"')
-    "foo"
-    """
-    def is_quoted_string(s):
-        s = s.strip()
-        return len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'")
-
-    if is_quoted_string(want) and is_quoted_string(got):
-        want = want.strip()[1:-1]
-        got = got.strip()[1:-1]
-    return want, got
-
-
-def str_prefix(s):
-    return s % {'_': ''}
 
 
 class CaptureQueriesContext:
@@ -624,6 +619,9 @@ class CaptureQueriesContext:
     def __enter__(self):
         self.force_debug_cursor = self.connection.force_debug_cursor
         self.connection.force_debug_cursor = True
+        # Run any initialization queries if needed so that they won't be
+        # included as part of the count.
+        self.connection.ensure_connection()
         self.initial_queries = len(self.connection.queries_log)
         self.final_queries = None
         request_started.disconnect(reset_queries)
@@ -653,26 +651,6 @@ class ignore_warnings(TestContextDecorator):
 
     def disable(self):
         self.catch_warnings.__exit__(*sys.exc_info())
-
-
-@contextmanager
-def patch_logger(logger_name, log_level, log_kwargs=False):
-    """
-    Context manager that takes a named logger and the logging level
-    and provides a simple mock-like list of messages received
-    """
-    calls = []
-
-    def replacement(msg, *args, **kwargs):
-        call = msg % args
-        calls.append((call, kwargs) if log_kwargs else call)
-    logger = logging.getLogger(logger_name)
-    orig = getattr(logger, log_level)
-    setattr(logger, log_level, replacement)
-    try:
-        yield calls
-    finally:
-        setattr(logger, log_level, orig)
 
 
 # On OSes that don't provide tzset (Windows), we can't set the timezone
@@ -779,7 +757,7 @@ def require_jinja2(test_func):
     Django template engine for a test or skip it if Jinja2 isn't available.
     """
     test_func = skipIf(jinja2 is None, "this test requires jinja2")(test_func)
-    test_func = override_settings(TEMPLATES=[{
+    return override_settings(TEMPLATES=[{
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
         'APP_DIRS': True,
     }, {
@@ -787,7 +765,6 @@ def require_jinja2(test_func):
         'APP_DIRS': True,
         'OPTIONS': {'keep_trailing_newline': True},
     }])(test_func)
-    return test_func
 
 
 class override_script_prefix(TestContextDecorator):
@@ -852,6 +829,24 @@ class isolate_apps(TestContextDecorator):
 def tag(*tags):
     """Decorator to add tags to a test class or method."""
     def decorator(obj):
-        setattr(obj, 'tags', set(tags))
+        if hasattr(obj, 'tags'):
+            obj.tags = obj.tags.union(tags)
+        else:
+            setattr(obj, 'tags', set(tags))
         return obj
     return decorator
+
+
+@contextmanager
+def register_lookup(field, *lookups, lookup_name=None):
+    """
+    Context manager to temporarily register lookups on a model field using
+    lookup_name (or the lookup's lookup_name if not provided).
+    """
+    try:
+        for lookup in lookups:
+            field.register_lookup(lookup, lookup_name)
+        yield
+    finally:
+        for lookup in lookups:
+            field._unregister_lookup(lookup, lookup_name)

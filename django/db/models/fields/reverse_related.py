@@ -10,13 +10,13 @@ they're the closest concept currently available.
 """
 
 from django.core import exceptions
-from django.utils.encoding import force_text
 from django.utils.functional import cached_property
 
 from . import BLANK_CHOICE_DASH
+from .mixins import FieldCacheMixin
 
 
-class ForeignObjectRel:
+class ForeignObjectRel(FieldCacheMixin):
     """
     Used by ForeignObject to store information about the relation.
 
@@ -114,7 +114,10 @@ class ForeignObjectRel:
             self.related_model._meta.model_name,
         )
 
-    def get_choices(self, include_blank=True, blank_choice=BLANK_CHOICE_DASH):
+    def get_choices(
+        self, include_blank=True, blank_choice=BLANK_CHOICE_DASH,
+        limit_choices_to=None, ordering=(),
+    ):
         """
         Return choices with a default blank choices included, for use
         as <select> choices for this field.
@@ -122,8 +125,12 @@ class ForeignObjectRel:
         Analog of django.db.models.fields.Field.get_choices(), provided
         initially for utilization by RelatedFieldListFilter.
         """
+        limit_choices_to = limit_choices_to or self.limit_choices_to
+        qs = self.related_model._default_manager.complex_filter(limit_choices_to)
+        if ordering:
+            qs = qs.order_by(*ordering)
         return (blank_choice if include_blank else []) + [
-            (x._get_pk_val(), force_text(x)) for x in self.related_model._default_manager.all()
+            (x.pk, str(x)) for x in qs
         ]
 
     def is_hidden(self):
@@ -149,10 +156,10 @@ class ForeignObjectRel:
     def get_accessor_name(self, model=None):
         # This method encapsulates the logic that decides what name to give an
         # accessor descriptor that retrieves related many-to-one or
-        # many-to-many objects. It uses the lower-cased object_name + "_set",
-        # but this can be overridden with the "related_name" option.
-        # Due to backwards compatibility ModelForms need to be able to provide
-        # an alternate model. See BaseInlineFormSet.get_default_prefix().
+        # many-to-many objects. It uses the lowercased object_name + "_set",
+        # but this can be overridden with the "related_name" option. Due to
+        # backwards compatibility ModelForms need to be able to provide an
+        # alternate model. See BaseInlineFormSet.get_default_prefix().
         opts = model._meta if model else self.related_model._meta
         model = model or self.related_model
         if self.multiple:
@@ -163,11 +170,15 @@ class ForeignObjectRel:
             return self.related_name
         return opts.model_name + ('_set' if self.multiple else '')
 
-    def get_cache_name(self):
-        return "_%s_cache" % self.get_accessor_name()
+    def get_path_info(self, filtered_relation=None):
+        return self.field.get_reverse_path_info(filtered_relation)
 
-    def get_path_info(self):
-        return self.field.get_reverse_path_info()
+    def get_cache_name(self):
+        """
+        Return the name of the cache key to use for storing an instance of the
+        forward model on the reverse model.
+        """
+        return self.get_accessor_name()
 
 
 class ManyToOneRel(ForeignObjectRel):

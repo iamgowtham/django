@@ -17,7 +17,7 @@ class CashField(models.DecimalField):
         kwargs['decimal_places'] = 2
         super().__init__(**kwargs)
 
-    def from_db_value(self, value, expression, connection, context):
+    def from_db_value(self, value, expression, connection):
         cash = Cash(value)
         cash.vendor = connection.vendor
         return cash

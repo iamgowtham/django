@@ -162,7 +162,7 @@ class OneToOneTests(TestCase):
 
     def test_create_models_m2m(self):
         """
-        Modles are created via the m2m relation if the remote model has a
+        Models are created via the m2m relation if the remote model has a
         OneToOneField (#1064, #1506).
         """
         f = Favorites(name='Fred')
@@ -196,6 +196,36 @@ class OneToOneTests(TestCase):
         # UndergroundBar.
         p.undergroundbar = None
 
+    def test_assign_none_to_null_cached_reverse_relation(self):
+        p = Place.objects.get(name='Demon Dogs')
+        # Prime the relation's cache with a value of None.
+        with self.assertRaises(Place.undergroundbar.RelatedObjectDoesNotExist):
+            getattr(p, 'undergroundbar')
+        # Assigning None works if there isn't a related UndergroundBar and the
+        # reverse cache has a value of None.
+        p.undergroundbar = None
+
+    def test_assign_o2o_id_value(self):
+        b = UndergroundBar.objects.create(place=self.p1)
+        b.place_id = self.p2.pk
+        b.save()
+        self.assertEqual(b.place_id, self.p2.pk)
+        self.assertFalse(UndergroundBar.place.is_cached(b))
+        self.assertEqual(b.place, self.p2)
+        self.assertTrue(UndergroundBar.place.is_cached(b))
+        # Reassigning the same value doesn't clear a cached instance.
+        b.place_id = self.p2.pk
+        self.assertTrue(UndergroundBar.place.is_cached(b))
+
+    def test_assign_o2o_id_none(self):
+        b = UndergroundBar.objects.create(place=self.p1)
+        b.place_id = None
+        b.save()
+        self.assertIsNone(b.place_id)
+        self.assertFalse(UndergroundBar.place.is_cached(b))
+        self.assertIsNone(b.place)
+        self.assertTrue(UndergroundBar.place.is_cached(b))
+
     def test_related_object_cache(self):
         """ Regression test for #6886 (the related-object cache) """
 
@@ -207,7 +237,7 @@ class OneToOneTests(TestCase):
         self.assertIs(p.restaurant, r)
 
         # But if we kill the cache, we get a new object
-        del p._restaurant_cache
+        del p._state.fields_cache['restaurant']
         self.assertIsNot(p.restaurant, r)
 
         # Reassigning the Restaurant object results in an immediate cache update
@@ -226,7 +256,11 @@ class OneToOneTests(TestCase):
         setattr(p, 'restaurant', None)
 
         # You also can't assign an object of the wrong type here
-        with self.assertRaises(ValueError):
+        msg = (
+            'Cannot assign "<Place: Demon Dogs the place>": '
+            '"Place.restaurant" must be a "Restaurant" instance.'
+        )
+        with self.assertRaisesMessage(ValueError, msg):
             setattr(p, 'restaurant', p)
 
         # Creation using keyword argument should cache the related object.
@@ -237,7 +271,7 @@ class OneToOneTests(TestCase):
         # Creation using keyword argument and unsaved related instance (#8070).
         p = Place()
         r = Restaurant(place=p)
-        self.assertTrue(r.place is p)
+        self.assertIs(r.place, p)
 
         # Creation using attname keyword argument and an id will cause the related
         # object to be fetched.
@@ -266,6 +300,14 @@ class OneToOneTests(TestCase):
         num_deleted, objs = Pointer.objects.filter(other__name='name').delete()
         self.assertEqual(num_deleted, 1)
         self.assertEqual(objs, {'one_to_one.Pointer': 1})
+
+    def test_save_nullable_o2o_after_parent(self):
+        place = Place(name='Rose tattoo')
+        bar = UndergroundBar(place=place)
+        place.save()
+        bar.save()
+        bar.refresh_from_db()
+        self.assertEqual(bar.place, place)
 
     def test_reverse_object_does_not_exist_cache(self):
         """
@@ -494,3 +536,13 @@ class OneToOneTests(TestCase):
         pointer = ToFieldPointer.objects.create(target=target)
         self.assertSequenceEqual(ToFieldPointer.objects.filter(target=target), [pointer])
         self.assertSequenceEqual(ToFieldPointer.objects.filter(pk__exact=pointer), [pointer])
+
+    def test_cached_relation_invalidated_on_save(self):
+        """
+        Model.save() invalidates stale OneToOneField relations after a primary
+        key assignment.
+        """
+        self.assertEqual(self.b1.place, self.p1)  # caches b1.place
+        self.b1.place_id = self.p2.pk
+        self.b1.save()
+        self.assertEqual(self.b1.place, self.p2)

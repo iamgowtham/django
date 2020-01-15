@@ -7,15 +7,19 @@ import unittest
 from collections import Counter
 from contextlib import contextmanager
 from copy import copy
+from difflib import get_close_matches
 from functools import wraps
+from unittest.suite import _DebugResult
 from unittest.util import safe_repr
-from urllib.parse import unquote, urljoin, urlparse, urlsplit
+from urllib.parse import (
+    parse_qsl, unquote, urlencode, urljoin, urlparse, urlsplit, urlunparse,
+)
 from urllib.request import url2pathname
 
 from django.apps import apps
 from django.conf import settings
 from django.core import mail
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.core.files import locks
 from django.core.handlers.wsgi import WSGIHandler, get_path_info
 from django.core.management import call_command
@@ -33,8 +37,7 @@ from django.test.utils import (
     CaptureQueriesContext, ContextList, compare_xml, modify_settings,
     override_settings,
 )
-from django.utils.decorators import classproperty
-from django.utils.encoding import force_text
+from django.utils.functional import classproperty
 from django.views.static import serve
 
 __all__ = ('TestCase', 'TransactionTestCase',
@@ -78,7 +81,7 @@ class _AssertNumQueriesContext(CaptureQueriesContext):
             "%d queries executed, %d expected\nCaptured queries were:\n%s" % (
                 executed, self.num,
                 '\n'.join(
-                    query['sql'] for query in self.captured_queries
+                    '%d. %s' % (i, query['sql']) for i, query in enumerate(self.captured_queries, start=1)
                 )
             )
         )
@@ -114,11 +117,12 @@ class _AssertTemplateUsedContext:
 
         if not self.test():
             message = self.message()
-            if len(self.rendered_templates) == 0:
-                message += ' No template was rendered.'
-            else:
+            if self.rendered_templates:
                 message += ' Following templates were rendered: %s' % (
-                    ', '.join(self.rendered_template_names))
+                    ', '.join(self.rendered_template_names)
+                )
+            else:
+                message += ' No template was rendered.'
             self.test_case.fail(message)
 
 
@@ -130,17 +134,13 @@ class _AssertTemplateNotUsedContext(_AssertTemplateUsedContext):
         return '%s was rendered.' % self.template_name
 
 
-class _CursorFailure:
-    def __init__(self, cls_name, wrapped):
-        self.cls_name = cls_name
+class _DatabaseFailure:
+    def __init__(self, wrapped, message):
         self.wrapped = wrapped
+        self.message = message
 
     def __call__(self):
-        raise AssertionError(
-            "Database queries aren't allowed in SimpleTestCase. "
-            "Either use TestCase or TransactionTestCase to ensure proper test isolation or "
-            "set %s.allow_database_queries to True to silence this failure." % self.cls_name
-        )
+        raise AssertionError(self.message)
 
 
 class SimpleTestCase(unittest.TestCase):
@@ -151,9 +151,19 @@ class SimpleTestCase(unittest.TestCase):
     _overridden_settings = None
     _modified_settings = None
 
-    # Tests shouldn't be allowed to query the database since
-    # this base class doesn't enforce any isolation.
-    allow_database_queries = False
+    databases = set()
+    _disallowed_database_msg = (
+        'Database %(operation)s to %(alias)r are not allowed in SimpleTestCase '
+        'subclasses. Either subclass TestCase or TransactionTestCase to ensure '
+        'proper test isolation or add %(alias)r to %(test)s.databases to silence '
+        'this failure.'
+    )
+    _disallowed_connection_methods = [
+        ('connect', 'connections'),
+        ('temporary_connection', 'connections'),
+        ('cursor', 'queries'),
+        ('chunked_cursor', 'queries'),
+    ]
 
     @classmethod
     def setUpClass(cls):
@@ -164,19 +174,54 @@ class SimpleTestCase(unittest.TestCase):
         if cls._modified_settings:
             cls._cls_modified_context = modify_settings(cls._modified_settings)
             cls._cls_modified_context.enable()
-        if not cls.allow_database_queries:
-            for alias in connections:
-                connection = connections[alias]
-                connection.cursor = _CursorFailure(cls.__name__, connection.cursor)
-                connection.chunked_cursor = _CursorFailure(cls.__name__, connection.chunked_cursor)
+        cls._add_databases_failures()
+
+    @classmethod
+    def _validate_databases(cls):
+        if cls.databases == '__all__':
+            return frozenset(connections)
+        for alias in cls.databases:
+            if alias not in connections:
+                message = '%s.%s.databases refers to %r which is not defined in settings.DATABASES.' % (
+                    cls.__module__,
+                    cls.__qualname__,
+                    alias,
+                )
+                close_matches = get_close_matches(alias, list(connections))
+                if close_matches:
+                    message += ' Did you mean %r?' % close_matches[0]
+                raise ImproperlyConfigured(message)
+        return frozenset(cls.databases)
+
+    @classmethod
+    def _add_databases_failures(cls):
+        cls.databases = cls._validate_databases()
+        for alias in connections:
+            if alias in cls.databases:
+                continue
+            connection = connections[alias]
+            for name, operation in cls._disallowed_connection_methods:
+                message = cls._disallowed_database_msg % {
+                    'test': '%s.%s' % (cls.__module__, cls.__qualname__),
+                    'alias': alias,
+                    'operation': operation,
+                }
+                method = getattr(connection, name)
+                setattr(connection, name, _DatabaseFailure(method, message))
+
+    @classmethod
+    def _remove_databases_failures(cls):
+        for alias in connections:
+            if alias in cls.databases:
+                continue
+            connection = connections[alias]
+            for name, _ in cls._disallowed_connection_methods:
+                method = getattr(connection, name)
+                setattr(connection, name, method.wrapped)
 
     @classmethod
     def tearDownClass(cls):
-        if not cls.allow_database_queries:
-            for alias in connections:
-                connection = connections[alias]
-                connection.cursor = connection.cursor.wrapped
-                connection.chunked_cursor = connection.chunked_cursor.wrapped
+        cls._remove_databases_failures()
         if hasattr(cls, '_cls_modified_context'):
             cls._cls_modified_context.disable()
             delattr(cls, '_cls_modified_context')
@@ -191,6 +236,21 @@ class SimpleTestCase(unittest.TestCase):
         set up. This means that user-defined Test Cases aren't required to
         include a call to super().setUp().
         """
+        self._setup_and_call(result)
+
+    def debug(self):
+        """Perform the same as __call__(), without catching the exception."""
+        debug_result = _DebugResult()
+        self._setup_and_call(debug_result, debug=True)
+
+    def _setup_and_call(self, result, debug=False):
+        """
+        Perform the following in order: pre-setup, run test, post-teardown,
+        skipping pre/post hooks if test is set to be skipped.
+
+        If debug=True, reraise any errors in setup and use super().debug()
+        instead of __call__() to run the test.
+        """
         testMethod = getattr(self, self._testMethodName)
         skipped = (
             getattr(self.__class__, "__unittest_skip__", False) or
@@ -201,13 +261,20 @@ class SimpleTestCase(unittest.TestCase):
             try:
                 self._pre_setup()
             except Exception:
+                if debug:
+                    raise
                 result.addError(self, sys.exc_info())
                 return
-        super().__call__(result)
+        if debug:
+            super().debug()
+        else:
+            super().__call__(result)
         if not skipped:
             try:
                 self._post_teardown()
             except Exception:
+                if debug:
+                    raise
                 result.addError(self, sys.exc_info())
                 return
 
@@ -245,9 +312,9 @@ class SimpleTestCase(unittest.TestCase):
         Assert that a response redirected to a specific URL and that the
         redirect URL can be loaded.
 
-        Won't work for external links since it uses TestClient to do a request
-        (use fetch_redirect_response=False to check such links without fetching
-        them).
+        Won't work for external links since it uses the test client to do a
+        request (use fetch_redirect_response=False to check such links without
+        fetching them).
         """
         if msg_prefix:
             msg_prefix += ": "
@@ -255,7 +322,7 @@ class SimpleTestCase(unittest.TestCase):
         if hasattr(response, 'redirect_chain'):
             # The request was a followed redirect
             self.assertTrue(
-                len(response.redirect_chain) > 0,
+                response.redirect_chain,
                 msg_prefix + "Response didn't redirect as expected: Response code was %d (expected %d)"
                 % (response.status_code, status_code)
             )
@@ -303,19 +370,44 @@ class SimpleTestCase(unittest.TestCase):
                         "Otherwise, use assertRedirects(..., fetch_redirect_response=False)."
                         % (url, domain)
                     )
-                redirect_response = response.client.get(path, QueryDict(query), secure=(scheme == 'https'))
-
                 # Get the redirection page, using the same client that was used
                 # to obtain the original response.
+                extra = response.client.extra or {}
+                redirect_response = response.client.get(
+                    path,
+                    QueryDict(query),
+                    secure=(scheme == 'https'),
+                    **extra,
+                )
                 self.assertEqual(
                     redirect_response.status_code, target_status_code,
                     msg_prefix + "Couldn't retrieve redirection page '%s': response code was %d (expected %d)"
                     % (path, redirect_response.status_code, target_status_code)
                 )
 
-        self.assertEqual(
+        self.assertURLEqual(
             url, expected_url,
             msg_prefix + "Response redirected to '%s', expected '%s'" % (url, expected_url)
+        )
+
+    def assertURLEqual(self, url1, url2, msg_prefix=''):
+        """
+        Assert that two URLs are the same, ignoring the order of query string
+        parameters except for parameters with the same name.
+
+        For example, /path/?x=1&y=2 is equal to /path/?y=2&x=1, but
+        /path/?a=1&a=2 isn't equal to /path/?a=2&a=1.
+        """
+        def normalize(url):
+            """Sort the URL's query string parameters."""
+            url = str(url)  # Coerce reverse_lazy() URLs.
+            scheme, netloc, path, params, query, fragment = urlparse(url)
+            query_parts = sorted(parse_qsl(query))
+            return urlunparse((scheme, netloc, path, params, urlencode(query_parts), fragment))
+
+        self.assertEqual(
+            normalize(url1), normalize(url2),
+            msg_prefix + "Expected '%s' to equal '%s'." % (url1, url2)
         )
 
     def _assert_contains(self, response, text, status_code, msg_prefix, html):
@@ -338,7 +430,7 @@ class SimpleTestCase(unittest.TestCase):
         else:
             content = response.content
         if not isinstance(text, bytes) or html:
-            text = force_text(text, encoding=response.charset)
+            text = str(text)
             content = content.decode(response.charset)
             text_repr = "'%s'" % text
         else:
@@ -429,7 +521,7 @@ class SimpleTestCase(unittest.TestCase):
                         msg_prefix + "The form '%s' in context %d does not"
                         " contain the non-field error '%s'"
                         " (actual errors: %s)" %
-                        (form, i, err, non_field_errors)
+                        (form, i, err, non_field_errors or 'none')
                     )
         if not found_form:
             self.fail(msg_prefix + "The form '%s' was not used to render the response" % form)
@@ -488,7 +580,7 @@ class SimpleTestCase(unittest.TestCase):
                 elif form_index is not None:
                     non_field_errors = context[formset].forms[form_index].non_field_errors()
                     self.assertFalse(
-                        len(non_field_errors) == 0,
+                        not non_field_errors,
                         msg_prefix + "The formset '%s', form %d in context %d "
                         "does not contain any non-field errors." % (formset, form_index, i)
                     )
@@ -501,7 +593,7 @@ class SimpleTestCase(unittest.TestCase):
                 else:
                     non_form_errors = context[formset].non_form_errors()
                     self.assertFalse(
-                        len(non_form_errors) == 0,
+                        not non_form_errors,
                         msg_prefix + "The formset '%s' in context %d does not "
                         "contain any non-form errors." % (formset, i)
                     )
@@ -585,14 +677,26 @@ class SimpleTestCase(unittest.TestCase):
         )
 
     @contextmanager
-    def _assert_raises_message_cm(self, expected_exception, expected_message):
-        with self.assertRaises(expected_exception) as cm:
+    def _assert_raises_or_warns_cm(self, func, cm_attr, expected_exception, expected_message):
+        with func(expected_exception) as cm:
             yield cm
-        self.assertIn(expected_message, str(cm.exception))
+        self.assertIn(expected_message, str(getattr(cm, cm_attr)))
+
+    def _assertFooMessage(self, func, cm_attr, expected_exception, expected_message, *args, **kwargs):
+        callable_obj = None
+        if args:
+            callable_obj, *args = args
+        cm = self._assert_raises_or_warns_cm(func, cm_attr, expected_exception, expected_message)
+        # Assertion used in context manager fashion.
+        if callable_obj is None:
+            return cm
+        # Assertion was passed a callable.
+        with cm:
+            callable_obj(*args, **kwargs)
 
     def assertRaisesMessage(self, expected_exception, expected_message, *args, **kwargs):
         """
-        Assert that expected_message is found in the the message of a raised
+        Assert that expected_message is found in the message of a raised
         exception.
 
         Args:
@@ -601,18 +705,20 @@ class SimpleTestCase(unittest.TestCase):
             args: Function to be called and extra positional args.
             kwargs: Extra kwargs.
         """
-        callable_obj = None
-        if len(args):
-            callable_obj = args[0]
-            args = args[1:]
+        return self._assertFooMessage(
+            self.assertRaises, 'exception', expected_exception, expected_message,
+            *args, **kwargs
+        )
 
-        cm = self._assert_raises_message_cm(expected_exception, expected_message)
-        # Assertion used in context manager fashion.
-        if callable_obj is None:
-            return cm
-        # Assertion was passed a callable.
-        with cm:
-            callable_obj(*args, **kwargs)
+    def assertWarnsMessage(self, expected_warning, expected_message, *args, **kwargs):
+        """
+        Same as assertRaisesMessage but for assertWarns() instead of
+        assertRaises().
+        """
+        return self._assertFooMessage(
+            self.assertWarns, 'warning', expected_warning, expected_message,
+            *args, **kwargs
+        )
 
     def assertFieldOutput(self, fieldclass, valid, invalid, field_args=None,
                           field_kwargs=None, empty_value=''):
@@ -634,7 +740,7 @@ class SimpleTestCase(unittest.TestCase):
         if field_kwargs is None:
             field_kwargs = {}
         required = fieldclass(*field_args, **field_kwargs)
-        optional = fieldclass(*field_args, **dict(field_kwargs, required=False))
+        optional = fieldclass(*field_args, **{**field_kwargs, 'required': False})
         # test valid inputs
         for input, output in valid.items():
             self.assertEqual(required.clean(input), output)
@@ -649,7 +755,7 @@ class SimpleTestCase(unittest.TestCase):
                 optional.clean(input)
             self.assertEqual(context_manager.exception.messages, errors)
         # test required inputs
-        error_required = [force_text(required.error_messages['required'])]
+        error_required = [required.error_messages['required']]
         for e in required.empty_values:
             with self.assertRaises(ValidationError) as context_manager:
                 required.clean(e)
@@ -708,7 +814,7 @@ class SimpleTestCase(unittest.TestCase):
         """
         try:
             data = json.loads(raw)
-        except ValueError:
+        except json.JSONDecodeError:
             self.fail("First argument is not valid JSON: %r" % raw)
         if isinstance(expected_data, str):
             try:
@@ -725,12 +831,12 @@ class SimpleTestCase(unittest.TestCase):
         """
         try:
             data = json.loads(raw)
-        except ValueError:
+        except json.JSONDecodeError:
             self.fail("First argument is not valid JSON: %r" % raw)
         if isinstance(expected_data, str):
             try:
                 expected_data = json.loads(expected_data)
-            except ValueError:
+            except json.JSONDecodeError:
                 self.fail("Second argument is not valid JSON: %r" % expected_data)
         self.assertNotEqual(data, expected_data, msg=msg)
 
@@ -783,18 +889,18 @@ class TransactionTestCase(SimpleTestCase):
     # Subclasses can define fixtures which will be automatically installed.
     fixtures = None
 
-    # Do the tests in this class query non-default databases?
-    multi_db = False
+    databases = {DEFAULT_DB_ALIAS}
+    _disallowed_database_msg = (
+        'Database %(operation)s to %(alias)r are not allowed in this test. '
+        'Add %(alias)r to %(test)s.databases to ensure proper test isolation '
+        'and silence this failure.'
+    )
 
     # If transactions aren't available, Django will serialize the database
     # contents into a fixture during setup and flush and reload them
     # during teardown (as flush does not restore data from migrations).
     # This can be slow; this flag allows enabling on a per-case basis.
     serialized_rollback = False
-
-    # Since tests will be wrapped in a transaction, or serialized if they
-    # are not available, we allow queries to be run.
-    allow_database_queries = True
 
     def _pre_setup(self):
         """
@@ -827,18 +933,21 @@ class TransactionTestCase(SimpleTestCase):
                     enter=False,
                 )
             raise
+        # Clear the queries_log so that it's less likely to overflow (a single
+        # test probably won't execute 9K queries). If queries_log overflows,
+        # then assertNumQueries() doesn't work.
+        for db_name in self._databases_names(include_mirrors=False):
+            connections[db_name].queries_log.clear()
 
     @classmethod
     def _databases_names(cls, include_mirrors=True):
-        # If the test case has a multi_db=True flag, act on all databases,
-        # including mirrors or not. Otherwise, just on the default DB.
-        if cls.multi_db:
-            return [
-                alias for alias in connections
-                if include_mirrors or not connections[alias].settings_dict['TEST']['MIRROR']
-            ]
-        else:
-            return [DEFAULT_DB_ALIAS]
+        # Only consider allowed database aliases, including mirrors or not.
+        return [
+            alias for alias in connections
+            if alias in cls.databases and (
+                include_mirrors or not connections[alias].settings_dict['TEST']['MIRROR']
+            )
+        ]
 
     def _reset_sequences(self, db_name):
         conn = connections[db_name]
@@ -847,9 +956,9 @@ class TransactionTestCase(SimpleTestCase):
                 no_style(), conn.introspection.sequence_list())
             if sql_list:
                 with transaction.atomic(using=db_name):
-                    cursor = conn.cursor()
-                    for sql in sql_list:
-                        cursor.execute(sql)
+                    with conn.cursor() as cursor:
+                        for sql in sql_list:
+                            cursor.execute(sql)
 
     def _fixture_setup(self):
         for db_name in self._databases_names(include_mirrors=False):
@@ -857,8 +966,7 @@ class TransactionTestCase(SimpleTestCase):
             if self.reset_sequences:
                 self._reset_sequences(db_name)
 
-            # If we need to provide replica initial data from migrated apps,
-            # then do so.
+            # Provide replica initial data from migrated apps, if needed.
             if self.serialized_rollback and hasattr(connections[db_name], "_test_serialized_contents"):
                 if self.available_apps is not None:
                     apps.unset_available_apps()
@@ -945,9 +1053,13 @@ class TransactionTestCase(SimpleTestCase):
             func(*args, **kwargs)
 
 
-def connections_support_transactions():
-    """Return True if all connections support transactions."""
-    return all(conn.features.supports_transactions for conn in connections.all())
+def connections_support_transactions(aliases=None):
+    """
+    Return whether or not all (or specified) connections support
+    transactions.
+    """
+    conns = connections.all() if aliases is None else (connections[alias] for alias in aliases)
+    return all(conn.features.supports_transactions for conn in conns)
 
 
 class TestCase(TransactionTestCase):
@@ -980,32 +1092,34 @@ class TestCase(TransactionTestCase):
             atomics[db_name].__exit__(None, None, None)
 
     @classmethod
+    def _databases_support_transactions(cls):
+        return connections_support_transactions(cls.databases)
+
+    @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        if not connections_support_transactions():
+        if not cls._databases_support_transactions():
             return
         cls.cls_atomics = cls._enter_atomics()
 
         if cls.fixtures:
             for db_name in cls._databases_names(include_mirrors=False):
-                    try:
-                        call_command('loaddata', *cls.fixtures, **{
-                            'verbosity': 0,
-                            'commit': False,
-                            'database': db_name,
-                        })
-                    except Exception:
-                        cls._rollback_atomics(cls.cls_atomics)
-                        raise
+                try:
+                    call_command('loaddata', *cls.fixtures, **{'verbosity': 0, 'database': db_name})
+                except Exception:
+                    cls._rollback_atomics(cls.cls_atomics)
+                    cls._remove_databases_failures()
+                    raise
         try:
             cls.setUpTestData()
         except Exception:
             cls._rollback_atomics(cls.cls_atomics)
+            cls._remove_databases_failures()
             raise
 
     @classmethod
     def tearDownClass(cls):
-        if connections_support_transactions():
+        if cls._databases_support_transactions():
             cls._rollback_atomics(cls.cls_atomics)
             for conn in connections.all():
                 conn.close()
@@ -1017,12 +1131,12 @@ class TestCase(TransactionTestCase):
         pass
 
     def _should_reload_connections(self):
-        if connections_support_transactions():
+        if self._databases_support_transactions():
             return False
         return super()._should_reload_connections()
 
     def _fixture_setup(self):
-        if not connections_support_transactions():
+        if not self._databases_support_transactions():
             # If the backend does not support transactions, we should reload
             # class data before each test
             self.setUpTestData()
@@ -1032,7 +1146,7 @@ class TestCase(TransactionTestCase):
         self.atomics = self._enter_atomics()
 
     def _fixture_teardown(self):
-        if not connections_support_transactions():
+        if not self._databases_support_transactions():
             return super()._fixture_teardown()
         try:
             for db_name in reversed(self._databases_names()):
@@ -1054,7 +1168,7 @@ class CheckCondition:
         self.conditions = conditions
 
     def add_condition(self, condition, reason):
-        return self.__class__(*self.conditions + ((condition, reason),))
+        return self.__class__(*self.conditions, (condition, reason))
 
     def __get__(self, instance, cls=None):
         # Trigger access for all bases.
@@ -1069,12 +1183,24 @@ class CheckCondition:
         return False
 
 
-def _deferredSkip(condition, reason):
+def _deferredSkip(condition, reason, name):
     def decorator(test_func):
+        nonlocal condition
         if not (isinstance(test_func, type) and
                 issubclass(test_func, unittest.TestCase)):
             @wraps(test_func)
             def skip_wrapper(*args, **kwargs):
+                if (args and isinstance(args[0], unittest.TestCase) and
+                        connection.alias not in getattr(args[0], 'databases', {})):
+                    raise ValueError(
+                        "%s cannot be used on %s as %s doesn't allow queries "
+                        "against the %r database." % (
+                            name,
+                            args[0],
+                            args[0].__class__.__qualname__,
+                            connection.alias,
+                        )
+                    )
                 if condition():
                     raise unittest.SkipTest(reason)
                 return test_func(*args, **kwargs)
@@ -1082,6 +1208,16 @@ def _deferredSkip(condition, reason):
         else:
             # Assume a class is decorated
             test_item = test_func
+            databases = getattr(test_item, 'databases', None)
+            if not databases or connection.alias not in databases:
+                # Defer raising to allow importing test class's module.
+                def condition():
+                    raise ValueError(
+                        "%s cannot be used on %s as it doesn't allow queries "
+                        "against the '%s' database." % (
+                            name, test_item, connection.alias,
+                        )
+                    )
             # Retrieve the possibly existing value from the class's dict to
             # avoid triggering the descriptor.
             skip = test_func.__dict__.get('__unittest_skip__')
@@ -1097,7 +1233,8 @@ def skipIfDBFeature(*features):
     """Skip a test if a database has at least one of the named features."""
     return _deferredSkip(
         lambda: any(getattr(connection.features, feature, False) for feature in features),
-        "Database has feature(s) %s" % ", ".join(features)
+        "Database has feature(s) %s" % ", ".join(features),
+        'skipIfDBFeature',
     )
 
 
@@ -1105,7 +1242,8 @@ def skipUnlessDBFeature(*features):
     """Skip a test unless a database has all the named features."""
     return _deferredSkip(
         lambda: not all(getattr(connection.features, feature, False) for feature in features),
-        "Database doesn't support feature(s): %s" % ", ".join(features)
+        "Database doesn't support feature(s): %s" % ", ".join(features),
+        'skipUnlessDBFeature',
     )
 
 
@@ -1113,7 +1251,8 @@ def skipUnlessAnyDBFeature(*features):
     """Skip a test unless a database has any of the named features."""
     return _deferredSkip(
         lambda: not any(getattr(connection.features, feature, False) for feature in features),
-        "Database doesn't support any of the feature(s): %s" % ", ".join(features)
+        "Database doesn't support any of the feature(s): %s" % ", ".join(features),
+        'skipUnlessAnyDBFeature',
     )
 
 
@@ -1201,9 +1340,9 @@ class _MediaFilesHandler(FSFilesHandler):
 class LiveServerThread(threading.Thread):
     """Thread for running a live http server while the tests are running."""
 
-    def __init__(self, host, static_handler, connections_override=None):
+    def __init__(self, host, static_handler, connections_override=None, port=0):
         self.host = host
-        self.port = None
+        self.port = port
         self.is_ready = threading.Event()
         self.error = None
         self.static_handler = static_handler
@@ -1223,8 +1362,10 @@ class LiveServerThread(threading.Thread):
         try:
             # Create the handler for serving static and media files
             handler = self.static_handler(_MediaFilesHandler(WSGIHandler()))
-            self.httpd = self._create_server(0)
-            self.port = self.httpd.server_address[1]
+            self.httpd = self._create_server()
+            # If binding to port zero, assign the port allocated by the OS.
+            if self.port == 0:
+                self.port = self.httpd.server_address[1]
             self.httpd.set_app(handler)
             self.is_ready.set()
             self.httpd.serve_forever()
@@ -1234,8 +1375,8 @@ class LiveServerThread(threading.Thread):
         finally:
             connections.close_all()
 
-    def _create_server(self, port):
-        return ThreadedWSGIServer((self.host, port), QuietWSGIRequestHandler, allow_reuse_address=False)
+    def _create_server(self):
+        return ThreadedWSGIServer((self.host, self.port), QuietWSGIRequestHandler, allow_reuse_address=False)
 
     def terminate(self):
         if hasattr(self, 'httpd'):
@@ -1257,12 +1398,17 @@ class LiveServerTestCase(TransactionTestCase):
     thread can see the changes.
     """
     host = 'localhost'
+    port = 0
     server_thread_class = LiveServerThread
     static_handler = _StaticFilesHandler
 
     @classproperty
     def live_server_url(cls):
         return 'http://%s:%s' % (cls.host, cls.server_thread.port)
+
+    @classproperty
+    def allowed_host(cls):
+        return cls.host
 
     @classmethod
     def setUpClass(cls):
@@ -1273,11 +1419,11 @@ class LiveServerTestCase(TransactionTestCase):
             # the server thread.
             if conn.vendor == 'sqlite' and conn.is_in_memory_db():
                 # Explicitly enable thread-shareability for this connection
-                conn.allow_thread_sharing = True
+                conn.inc_thread_sharing()
                 connections_override[conn.alias] = conn
 
         cls._live_server_modified_settings = modify_settings(
-            ALLOWED_HOSTS={'append': cls.host},
+            ALLOWED_HOSTS={'append': cls.allowed_host},
         )
         cls._live_server_modified_settings.enable()
         cls.server_thread = cls._create_server_thread(connections_override)
@@ -1298,6 +1444,7 @@ class LiveServerTestCase(TransactionTestCase):
             cls.host,
             cls.static_handler,
             connections_override=connections_override,
+            port=cls.port,
         )
 
     @classmethod
@@ -1308,10 +1455,9 @@ class LiveServerTestCase(TransactionTestCase):
             # Terminate the live server's thread
             cls.server_thread.terminate()
 
-        # Restore sqlite in-memory database connections' non-shareability
-        for conn in connections.all():
-            if conn.vendor == 'sqlite' and conn.is_in_memory_db():
-                conn.allow_thread_sharing = False
+            # Restore sqlite in-memory database connections' non-shareability.
+            for conn in cls.server_thread.connections_override.values():
+                conn.dec_thread_sharing()
 
     @classmethod
     def tearDownClass(cls):

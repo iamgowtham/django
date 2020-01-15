@@ -9,8 +9,9 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
+from django.core.servers.basehttp import WSGIServer
 from django.test import LiveServerTestCase, override_settings
-from django.test.utils import captured_stdout
+from django.test.testcases import LiveServerThread, QuietWSGIRequestHandler
 
 from .models import Person
 
@@ -51,24 +52,97 @@ class LiveServerAddress(LiveServerBase):
         self.assertEqual(self.live_server_url_test[0], self.live_server_url)
 
 
+class LiveServerSingleThread(LiveServerThread):
+    def _create_server(self):
+        return WSGIServer((self.host, self.port), QuietWSGIRequestHandler, allow_reuse_address=False)
+
+
+class SingleThreadLiveServerTestCase(LiveServerTestCase):
+    server_thread_class = LiveServerSingleThread
+
+
 class LiveServerViews(LiveServerBase):
     def test_protocol(self):
         """Launched server serves with HTTP 1.1."""
-        with captured_stdout() as debug_output:
-            conn = HTTPConnection(LiveServerViews.server_thread.host, LiveServerViews.server_thread.port)
-            try:
-                conn.set_debuglevel(1)
-                conn.request('GET', '/example_view/', headers={"Connection": "keep-alive"})
-                conn.getresponse().read()
-                conn.request('GET', '/example_view/', headers={"Connection": "close"})
-                conn.getresponse()
-            finally:
-                conn.close()
-        self.assertEqual(debug_output.getvalue().count("reply: 'HTTP/1.1 200 OK"), 2)
+        with self.urlopen('/example_view/') as f:
+            self.assertEqual(f.version, 11)
+
+    def test_closes_connection_without_content_length(self):
+        """
+        A HTTP 1.1 server is supposed to support keep-alive. Since our
+        development server is rather simple we support it only in cases where
+        we can detect a content length from the response. This should be doable
+        for all simple views and streaming responses where an iterable with
+        length of one is passed. The latter follows as result of `set_content_length`
+        from https://github.com/python/cpython/blob/master/Lib/wsgiref/handlers.py.
+
+        If we cannot detect a content length we explicitly set the `Connection`
+        header to `close` to notify the client that we do not actually support
+        it.
+        """
+        conn = HTTPConnection(LiveServerViews.server_thread.host, LiveServerViews.server_thread.port, timeout=1)
+        try:
+            conn.request('GET', '/streaming_example_view/', headers={'Connection': 'keep-alive'})
+            response = conn.getresponse()
+            self.assertTrue(response.will_close)
+            self.assertEqual(response.read(), b'Iamastream')
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader('Connection'), 'close')
+
+            conn.request('GET', '/streaming_example_view/', headers={'Connection': 'close'})
+            response = conn.getresponse()
+            self.assertTrue(response.will_close)
+            self.assertEqual(response.read(), b'Iamastream')
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader('Connection'), 'close')
+        finally:
+            conn.close()
+
+    def test_keep_alive_on_connection_with_content_length(self):
+        """
+        See `test_closes_connection_without_content_length` for details. This
+        is a follow up test, which ensure that we do not close the connection
+        if not needed, hence allowing us to take advantage of keep-alive.
+        """
+        conn = HTTPConnection(LiveServerViews.server_thread.host, LiveServerViews.server_thread.port)
+        try:
+            conn.request('GET', '/example_view/', headers={"Connection": "keep-alive"})
+            response = conn.getresponse()
+            self.assertFalse(response.will_close)
+            self.assertEqual(response.read(), b'example view')
+            self.assertEqual(response.status, 200)
+            self.assertIsNone(response.getheader('Connection'))
+
+            conn.request('GET', '/example_view/', headers={"Connection": "close"})
+            response = conn.getresponse()
+            self.assertFalse(response.will_close)
+            self.assertEqual(response.read(), b'example view')
+            self.assertEqual(response.status, 200)
+            self.assertIsNone(response.getheader('Connection'))
+        finally:
+            conn.close()
+
+    def test_keep_alive_connection_clears_previous_request_data(self):
+        conn = HTTPConnection(LiveServerViews.server_thread.host, LiveServerViews.server_thread.port)
+        try:
+            conn.request('POST', '/method_view/', b'{}', headers={"Connection": "keep-alive"})
+            response = conn.getresponse()
+            self.assertFalse(response.will_close)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), b'POST')
+
+            conn.request('POST', '/method_view/', b'{}', headers={"Connection": "close"})
+            response = conn.getresponse()
+            self.assertFalse(response.will_close)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), b'POST')
+        finally:
+            conn.close()
 
     def test_404(self):
         with self.assertRaises(HTTPError) as err:
             self.urlopen('/')
+        err.exception.close()
         self.assertEqual(err.exception.code, 404, 'Expected 404 response')
 
     def test_view(self):
@@ -87,6 +161,7 @@ class LiveServerViews(LiveServerBase):
         """
         with self.assertRaises(HTTPError) as err:
             self.urlopen('/static/another_app/another_app_static_file.txt')
+        err.exception.close()
         self.assertEqual(err.exception.code, 404, 'Expected 404 response')
 
     def test_media_files(self):
@@ -96,6 +171,32 @@ class LiveServerViews(LiveServerBase):
     def test_environ(self):
         with self.urlopen('/environ_view/?%s' % urlencode({'q': 'тест'})) as f:
             self.assertIn(b"QUERY_STRING: 'q=%D1%82%D0%B5%D1%81%D1%82'", f.read())
+
+
+@override_settings(ROOT_URLCONF='servers.urls')
+class SingleTreadLiveServerViews(SingleThreadLiveServerTestCase):
+    available_apps = ['servers']
+
+    def test_closes_connection_with_content_length(self):
+        """
+        Contrast to
+        LiveServerViews.test_keep_alive_on_connection_with_content_length().
+        Persistent connections require threading server.
+        """
+        conn = HTTPConnection(
+            SingleTreadLiveServerViews.server_thread.host,
+            SingleTreadLiveServerViews.server_thread.port,
+            timeout=1,
+        )
+        try:
+            conn.request('GET', '/example_view/', headers={'Connection': 'keep-alive'})
+            response = conn.getresponse()
+            self.assertTrue(response.will_close)
+            self.assertEqual(response.read(), b'example view')
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader('Connection'), 'close')
+        finally:
+            conn.close()
 
 
 class LiveServerDatabase(LiveServerBase):
@@ -111,7 +212,8 @@ class LiveServerDatabase(LiveServerBase):
         """
         Data written to the database by a view can be read.
         """
-        self.urlopen('/create_model_instance/')
+        with self.urlopen('/create_model_instance/'):
+            pass
         self.assertQuerysetEqual(
             Person.objects.all().order_by('pk'),
             ['jane', 'robert', 'emily'],
@@ -129,10 +231,10 @@ class LiveServerPort(LiveServerBase):
         TestCase = type("TestCase", (LiveServerBase,), {})
         try:
             TestCase.setUpClass()
-        except socket.error as e:
+        except OSError as e:
             if e.errno == errno.EADDRINUSE:
                 # We're out of ports, LiveServerTestCase correctly fails with
-                # a socket error.
+                # an OSError.
                 return
             # Unexpected error.
             raise
@@ -144,8 +246,24 @@ class LiveServerPort(LiveServerBase):
                 "Acquired duplicate server addresses for server threads: %s" % self.live_server_url
             )
         finally:
-            if hasattr(TestCase, 'server_thread'):
-                TestCase.server_thread.terminate()
+            TestCase.tearDownClass()
+
+    def test_specified_port_bind(self):
+        """LiveServerTestCase.port customizes the server's port."""
+        TestCase = type('TestCase', (LiveServerBase,), {})
+        # Find an open port and tell TestCase to use it.
+        s = socket.socket()
+        s.bind(('', 0))
+        TestCase.port = s.getsockname()[1]
+        s.close()
+        TestCase.setUpClass()
+        try:
+            self.assertEqual(
+                TestCase.port, TestCase.server_thread.port,
+                'Did not use specified port for LiveServerTestCase thread: %s' % TestCase.port
+            )
+        finally:
+            TestCase.tearDownClass()
 
 
 class LiverServerThreadedTests(LiveServerBase):

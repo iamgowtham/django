@@ -45,6 +45,7 @@ class Happening(models.Model):
     name = models.CharField(blank=True, max_length=100, default="test")
     number1 = models.IntegerField(blank=True, default=standalone_number)
     number2 = models.IntegerField(blank=True, default=Numbers.get_static_number)
+    event = models.OneToOneField(Event, models.CASCADE, null=True)
 
 
 class Container:
@@ -57,3 +58,17 @@ class Container:
 
 class M2MModel(models.Model):
     groups = models.ManyToManyField(Group)
+
+
+class AbstractEvent(Event):
+    class Meta:
+        abstract = True
+        ordering = ['title']
+
+
+class MyEvent(AbstractEvent):
+    pass
+
+
+class Edition(models.Model):
+    event = models.ForeignKey('MyEvent', on_delete=models.CASCADE)

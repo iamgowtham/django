@@ -19,6 +19,9 @@ class MultiColSource:
         return self.__class__(relabels.get(self.alias, self.alias),
                               self.targets, self.sources, self.field)
 
+    def get_lookup(self, lookup):
+        return self.output_field.get_lookup(lookup)
+
 
 def get_normalized_value(value, lhs):
     from django.db.models import Model
@@ -60,7 +63,7 @@ class RelatedIn(In):
         if isinstance(self.lhs, MultiColSource):
             # For multicolumn lookups we need to build a multicolumn where clause.
             # This clause is either a SubqueryConstraint (for values that need to be compiled to
-            # SQL) or a OR-combined list of (col1 = val1 AND col2 = val2 AND ...) clauses.
+            # SQL) or an OR-combined list of (col1 = val1 AND col2 = val2 AND ...) clauses.
             from django.db.models.sql.where import WhereNode, SubqueryConstraint, AND, OR
 
             root_constraint = WhereNode(connector=OR)
@@ -81,7 +84,8 @@ class RelatedIn(In):
                     AND)
             return root_constraint.as_sql(compiler, connection)
         else:
-            if getattr(self.rhs, '_forced_pk', False):
+            if (not getattr(self.rhs, 'has_select_fields', True) and
+                    not getattr(self.lhs.field.target_field, 'primary_key', False)):
                 self.rhs.clear_select_clause()
                 if (getattr(self.lhs.output_field, 'primary_key', False) and
                         self.lhs.output_field.model == self.rhs.model):
@@ -97,7 +101,7 @@ class RelatedIn(In):
 
 class RelatedLookupMixin:
     def get_prep_lookup(self):
-        if not isinstance(self.lhs, MultiColSource) and self.rhs_is_direct_value():
+        if not isinstance(self.lhs, MultiColSource) and not hasattr(self.rhs, 'resolve_expression'):
             # If we get here, we are dealing with single-column relations.
             self.rhs = get_normalized_value(self.rhs, self.lhs)[0]
             # We need to run the related field's get_prep_value(). Consider case

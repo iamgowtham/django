@@ -1,12 +1,11 @@
 from django.db import models
 
-CHOICES = (
-    (1, 'first'),
-    (2, 'second'),
-)
-
 
 class Article(models.Model):
+    CHOICES = (
+        (1, 'first'),
+        (2, 'second'),
+    )
     headline = models.CharField(max_length=100, default='Default headline')
     pub_date = models.DateTimeField()
     status = models.IntegerField(blank=True, null=True, choices=CHOICES)
@@ -50,14 +49,6 @@ class Worker(models.Model):
 
     def __str__(self):
         return self.name
-
-
-class BrokenStrMethod(models.Model):
-    name = models.CharField(max_length=7)
-
-    def __str__(self):
-        # Intentionally broken (invalid start byte in byte string).
-        return b'Name\xff: %s'.decode() % self.name
 
 
 class NonAutoPK(models.Model):

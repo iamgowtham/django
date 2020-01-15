@@ -70,7 +70,13 @@ def module_has_submodule(package, module_name):
         return False
 
     full_module_name = package_name + '.' + module_name
-    return importlib_find(full_module_name, package_path) is not None
+    try:
+        return importlib_find(full_module_name, package_path) is not None
+    except (ModuleNotFoundError, AttributeError):
+        # When module_name is an invalid dotted path, Python raises
+        # ModuleNotFoundError. AttributeError is raised on PY36 (fixed in PY37)
+        # if the penultimate part of the path is not a package.
+        return False
 
 
 def module_dir(module):
@@ -80,7 +86,7 @@ def module_dir(module):
     Raise ValueError otherwise, e.g. for namespace packages that are split
     over several directories.
     """
-    # Convert to list because _NamespacePath does not support indexing on 3.3.
+    # Convert to list because _NamespacePath does not support indexing.
     paths = list(getattr(module, '__path__', []))
     if len(paths) == 1:
         return paths[0]

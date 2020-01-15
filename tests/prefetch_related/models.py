@@ -5,10 +5,9 @@ from django.contrib.contenttypes.fields import (
 )
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
+from django.db.models.query import ModelIterable, QuerySet
 from django.utils.functional import cached_property
 
-
-# Basic tests
 
 class Author(models.Model):
     name = models.CharField(max_length=50, unique=True)
@@ -16,11 +15,11 @@ class Author(models.Model):
     favorite_authors = models.ManyToManyField(
         'self', through='FavoriteAuthors', symmetrical=False, related_name='favors_me')
 
-    def __str__(self):
-        return self.name
-
     class Meta:
         ordering = ['id']
+
+    def __str__(self):
+        return self.name
 
 
 class AuthorWithAge(Author):
@@ -51,11 +50,11 @@ class Book(models.Model):
     title = models.CharField(max_length=255)
     authors = models.ManyToManyField(Author, related_name='books')
 
-    def __str__(self):
-        return self.title
-
     class Meta:
         ordering = ['id']
+
+    def __str__(self):
+        return self.title
 
 
 class BookWithYear(Book):
@@ -66,7 +65,12 @@ class BookWithYear(Book):
 
 
 class Bio(models.Model):
-    author = models.OneToOneField(Author, models.CASCADE)
+    author = models.OneToOneField(
+        Author,
+        models.CASCADE,
+        primary_key=True,
+        to_field='name',
+    )
     books = models.ManyToManyField(Book, blank=True)
 
 
@@ -74,15 +78,16 @@ class Reader(models.Model):
     name = models.CharField(max_length=50)
     books_read = models.ManyToManyField(Book, related_name='read_by')
 
-    def __str__(self):
-        return self.name
-
     class Meta:
         ordering = ['id']
 
+    def __str__(self):
+        return self.name
+
 
 class BookReview(models.Model):
-    book = models.ForeignKey(BookWithYear, models.CASCADE)
+    # Intentionally does not have a related name.
+    book = models.ForeignKey(BookWithYear, models.CASCADE, null=True)
     notes = models.TextField(null=True, blank=True)
 
 
@@ -95,6 +100,16 @@ class Qualification(models.Model):
         ordering = ['id']
 
 
+class ModelIterableSubclass(ModelIterable):
+    pass
+
+
+class TeacherQuerySet(QuerySet):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._iterable_class = ModelIterableSubclass
+
+
 class TeacherManager(models.Manager):
     def get_queryset(self):
         return super().get_queryset().prefetch_related('qualifications')
@@ -105,12 +120,13 @@ class Teacher(models.Model):
     qualifications = models.ManyToManyField(Qualification)
 
     objects = TeacherManager()
-
-    def __str__(self):
-        return "%s (%s)" % (self.name, ", ".join(q.name for q in self.qualifications.all()))
+    objects_custom = TeacherQuerySet.as_manager()
 
     class Meta:
         ordering = ['id']
+
+    def __str__(self):
+        return "%s (%s)" % (self.name, ", ".join(q.name for q in self.qualifications.all()))
 
 
 class Department(models.Model):
@@ -149,11 +165,16 @@ class TaggedItem(models.Model):
     favorite_fkey = models.CharField(max_length=64, null=True)
     favorite = GenericForeignKey('favorite_ct', 'favorite_fkey')
 
+    class Meta:
+        ordering = ['id']
+
     def __str__(self):
         return self.tag
 
-    class Meta:
-        ordering = ['id']
+
+class Article(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=20)
 
 
 class Bookmark(models.Model):
@@ -172,9 +193,12 @@ class Comment(models.Model):
     comment = models.TextField()
 
     # Content-object field
-    content_type = models.ForeignKey(ContentType, models.CASCADE)
+    content_type = models.ForeignKey(ContentType, models.CASCADE, null=True)
     object_pk = models.TextField()
     content_object = GenericForeignKey(ct_field="content_type", fk_field="object_pk")
+    content_type_uuid = models.ForeignKey(ContentType, models.CASCADE, related_name='comments', null=True)
+    object_pk_uuid = models.TextField()
+    content_object_uuid = GenericForeignKey(ct_field='content_type_uuid', fk_field='object_pk_uuid')
 
     class Meta:
         ordering = ['id']
@@ -227,11 +251,11 @@ class Employee(models.Model):
     name = models.CharField(max_length=50)
     boss = models.ForeignKey('self', models.SET_NULL, null=True, related_name='serfs')
 
-    def __str__(self):
-        return self.name
-
     class Meta:
         ordering = ['id']
+
+    def __str__(self):
+        return self.name
 
 
 # Ticket #19607
@@ -259,11 +283,11 @@ class Author2(models.Model):
     first_book = models.ForeignKey('Book', models.CASCADE, related_name='first_time_authors+')
     favorite_books = models.ManyToManyField('Book', related_name='+')
 
-    def __str__(self):
-        return self.name
-
     class Meta:
         ordering = ['id']
+
+    def __str__(self):
+        return self.name
 
 
 # Models for many-to-many with UUID pk test:

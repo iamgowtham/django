@@ -7,6 +7,17 @@ Simple mixins
 
 .. class:: django.views.generic.base.ContextMixin
 
+    **Attributes**
+
+    .. attribute:: extra_context
+
+        A dictionary to include in the context. This is a convenient way of
+        specifying some context in
+        :meth:`~django.views.generic.base.View.as_view`. Example usage::
+
+            from django.views.generic import TemplateView
+            TemplateView.as_view(extra_context={'title': 'Custom Title'})
+
     **Methods**
 
     .. method:: get_context_data(**kwargs)
@@ -72,7 +83,7 @@ Simple mixins
 
         The content type to use for the response. ``content_type`` is passed
         as a keyword argument to ``response_class``. Default is ``None`` --
-        meaning that Django uses :setting:`DEFAULT_CONTENT_TYPE`.
+        meaning that Django uses ``'text/html'``.
 
     **Methods**
 

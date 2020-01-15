@@ -12,6 +12,7 @@ from django.db.models.fields.files import ImageField, ImageFieldFile
 from django.db.models.fields.related import (
     ForeignKey, ForeignObject, ManyToManyField, OneToOneField,
 )
+from django.utils.translation import gettext_lazy as _
 
 try:
     from PIL import Image
@@ -46,35 +47,37 @@ class Whiz(models.Model):
         )
         ),
         (0, 'Other'),
+        (5, _('translated')),
     )
     c = models.IntegerField(choices=CHOICES, null=True)
 
 
-class Counter:
-    def __init__(self):
-        self.n = 1
+class WhizDelayed(models.Model):
+    c = models.IntegerField(choices=(), null=True)
 
-    def __iter__(self):
-        return self
 
-    def __next__(self):
-        if self.n > 5:
-            raise StopIteration
-        else:
-            self.n += 1
-            return (self.n, 'val-' + str(self.n))
+# Contrived way of adding choices later.
+WhizDelayed._meta.get_field('c').choices = Whiz.CHOICES
 
 
 class WhizIter(models.Model):
-    c = models.IntegerField(choices=Counter(), null=True)
+    c = models.IntegerField(choices=iter(Whiz.CHOICES), null=True)
 
 
 class WhizIterEmpty(models.Model):
-    c = models.CharField(choices=(x for x in []), blank=True, max_length=1)
+    c = models.CharField(choices=iter(()), blank=True, max_length=1)
+
+
+class Choiceful(models.Model):
+    no_choices = models.IntegerField(null=True)
+    empty_choices = models.IntegerField(choices=(), null=True)
+    with_choices = models.IntegerField(choices=[(1, 'A')], null=True)
+    empty_choices_bool = models.BooleanField(choices=())
+    empty_choices_text = models.TextField(choices=())
 
 
 class BigD(models.Model):
-    d = models.DecimalField(max_digits=38, decimal_places=30)
+    d = models.DecimalField(max_digits=32, decimal_places=30)
 
 
 class FloatModel(models.Model):
@@ -89,6 +92,18 @@ class UnicodeSlugField(models.Model):
     s = models.SlugField(max_length=255, allow_unicode=True)
 
 
+class AutoModel(models.Model):
+    value = models.AutoField(primary_key=True)
+
+
+class BigAutoModel(models.Model):
+    value = models.BigAutoField(primary_key=True)
+
+
+class SmallAutoModel(models.Model):
+    value = models.SmallAutoField(primary_key=True)
+
+
 class SmallIntegerModel(models.Model):
     value = models.SmallIntegerField()
 
@@ -100,6 +115,10 @@ class IntegerModel(models.Model):
 class BigIntegerModel(models.Model):
     value = models.BigIntegerField()
     null_value = models.BigIntegerField(null=True, blank=True)
+
+
+class PositiveBigIntegerModel(models.Model):
+    value = models.PositiveBigIntegerField()
 
 
 class PositiveSmallIntegerModel(models.Model):
@@ -116,7 +135,8 @@ class Post(models.Model):
 
 
 class NullBooleanModel(models.Model):
-    nbfield = models.NullBooleanField()
+    nbfield = models.BooleanField(null=True, blank=True)
+    nbfield_old = models.NullBooleanField()
 
 
 class BooleanModel(models.Model):
@@ -342,7 +362,7 @@ class AllFieldsModel(models.Model):
     fo = ForeignObject(
         'self',
         on_delete=models.CASCADE,
-        from_fields=['abstract_non_concrete_id'],
+        from_fields=['positive_integer'],
         to_fields=['id'],
         related_name='reverse'
     )
@@ -358,6 +378,10 @@ class AllFieldsModel(models.Model):
     content_type = models.ForeignKey(ContentType, models.CASCADE)
     gfk = GenericForeignKey()
     gr = GenericRelation(DataModel)
+
+
+class ManyToMany(models.Model):
+    m2m = models.ManyToManyField('self')
 
 
 ###############################################################################

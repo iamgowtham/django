@@ -2,7 +2,7 @@
 import time
 import warnings
 
-from django.core.exceptions import DjangoRuntimeWarning, ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
 
 
@@ -10,7 +10,7 @@ class InvalidCacheBackendError(ImproperlyConfigured):
     pass
 
 
-class CacheKeyWarning(DjangoRuntimeWarning):
+class CacheKeyWarning(RuntimeWarning):
     pass
 
 
@@ -97,8 +97,7 @@ class BaseCache:
         if version is None:
             version = self.version
 
-        new_key = self.key_func(key, self.key_prefix, version)
-        return new_key
+        return self.key_func(key, self.key_prefix, version)
 
     def add(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
         """
@@ -124,9 +123,17 @@ class BaseCache:
         """
         raise NotImplementedError('subclasses of BaseCache must provide a set() method')
 
+    def touch(self, key, timeout=DEFAULT_TIMEOUT, version=None):
+        """
+        Update the key's expiry time using timeout. Return True if successful
+        or False if the key does not exist.
+        """
+        raise NotImplementedError('subclasses of BaseCache must provide a touch() method')
+
     def delete(self, key, version=None):
         """
-        Delete a key from the cache, failing silently.
+        Delete a key from the cache and return whether it succeeded, failing
+        silently.
         """
         raise NotImplementedError('subclasses of BaseCache must provide a delete() method')
 
@@ -155,13 +162,15 @@ class BaseCache:
         Return the value of the key stored or retrieved.
         """
         val = self.get(key, version=version)
-        if val is None and default is not None:
+        if val is None:
             if callable(default):
                 default = default()
-            self.add(key, default, timeout=timeout, version=version)
-            # Fetch the value again to avoid a race condition if another caller
-            # added a value between the first get() and the add() above.
-            return self.get(key, default, version=version)
+            if default is not None:
+                self.add(key, default, timeout=timeout, version=version)
+                # Fetch the value again to avoid a race condition if another
+                # caller added a value between the first get() and the add()
+                # above.
+                return self.get(key, default, version=version)
         return val
 
     def has_key(self, key, version=None):
@@ -206,9 +215,13 @@ class BaseCache:
 
         If timeout is given, use that timeout for the key; otherwise use the
         default cache timeout.
+
+        On backends that support it, return a list of keys that failed
+        insertion, or an empty list if all keys were inserted successfully.
         """
         for key, value in data.items():
             self.set(key, value, timeout=timeout, version=version)
+        return []
 
     def delete_many(self, keys, version=None):
         """

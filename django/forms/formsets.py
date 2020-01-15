@@ -2,7 +2,7 @@ from django.core.exceptions import ValidationError
 from django.forms import Form
 from django.forms.fields import BooleanField, IntegerField
 from django.forms.utils import ErrorList
-from django.forms.widgets import HiddenInput
+from django.forms.widgets import HiddenInput, NumberInput
 from django.utils.functional import cached_property
 from django.utils.html import html_safe
 from django.utils.safestring import mark_safe
@@ -47,6 +47,8 @@ class BaseFormSet:
     """
     A collection of instances of the same Form class.
     """
+    ordering_widget = NumberInput
+
     def __init__(self, data=None, files=None, auto_id='id_%s', prefix=None,
                  initial=None, error_class=ErrorList, form_kwargs=None):
         self.is_bound = data is not None or files is not None
@@ -132,9 +134,10 @@ class BaseFormSet:
     def forms(self):
         """Instantiate forms at first property access."""
         # DoS protection is included in total_form_count()
-        forms = [self._construct_form(i, **self.get_form_kwargs(i))
-                 for i in range(self.total_form_count())]
-        return forms
+        return [
+            self._construct_form(i, **self.get_form_kwargs(i))
+            for i in range(self.total_form_count())
+        ]
 
     def get_form_kwargs(self, index):
         """
@@ -264,6 +267,10 @@ class BaseFormSet:
     def get_default_prefix(cls):
         return 'form'
 
+    @classmethod
+    def get_ordering_widget(cls):
+        return cls.ordering_widget
+
     def non_form_errors(self):
         """
         Return an ErrorList of errors that aren't associated with a particular
@@ -301,11 +308,10 @@ class BaseFormSet:
         self.errors
         for i in range(0, self.total_form_count()):
             form = self.forms[i]
-            if self.can_delete:
-                if self._should_delete_form(form):
-                    # This form is going to be deleted so any of its errors
-                    # should not cause the entire formset to be invalid.
-                    continue
+            if self.can_delete and self._should_delete_form(form):
+                # This form is going to be deleted so any of its errors
+                # shouldn't cause the entire formset to be invalid.
+                continue
             forms_valid &= form.is_valid()
         return forms_valid and not self.non_form_errors()
 
@@ -322,10 +328,15 @@ class BaseFormSet:
             return
         for i in range(0, self.total_form_count()):
             form = self.forms[i]
-            if not form.has_changed():
+            # Empty forms are unchanged forms beyond those with initial data.
+            if not form.has_changed() and i >= self.initial_form_count():
                 empty_forms_count += 1
-
-            self._errors.append(form.errors)
+            # Accessing errors calls full_clean() if necessary.
+            # _should_delete_form() requires cleaned_data.
+            form_errors = form.errors
+            if self.can_delete and self._should_delete_form(form):
+                continue
+            self._errors.append(form_errors)
         try:
             if (self.validate_max and
                     self.total_form_count() - len(self.deleted_forms) > self.max_num) or \
@@ -364,9 +375,18 @@ class BaseFormSet:
         if self.can_order:
             # Only pre-fill the ordering field for initial forms.
             if index is not None and index < self.initial_form_count():
-                form.fields[ORDERING_FIELD_NAME] = IntegerField(label=_('Order'), initial=index + 1, required=False)
+                form.fields[ORDERING_FIELD_NAME] = IntegerField(
+                    label=_('Order'),
+                    initial=index + 1,
+                    required=False,
+                    widget=self.get_ordering_widget(),
+                )
             else:
-                form.fields[ORDERING_FIELD_NAME] = IntegerField(label=_('Order'), required=False)
+                form.fields[ORDERING_FIELD_NAME] = IntegerField(
+                    label=_('Order'),
+                    required=False,
+                    widget=self.get_ordering_widget(),
+                )
         if self.can_delete:
             form.fields[DELETION_FIELD_NAME] = BooleanField(label=_('Delete'), required=False)
 
@@ -398,17 +418,17 @@ class BaseFormSet:
         # probably should be. It might make sense to render each form as a
         # table row with each field as a td.
         forms = ' '.join(form.as_table() for form in self)
-        return mark_safe('\n'.join([str(self.management_form), forms]))
+        return mark_safe(str(self.management_form) + '\n' + forms)
 
     def as_p(self):
         "Return this formset rendered as HTML <p>s."
         forms = ' '.join(form.as_p() for form in self)
-        return mark_safe('\n'.join([str(self.management_form), forms]))
+        return mark_safe(str(self.management_form) + '\n' + forms)
 
     def as_ul(self):
         "Return this formset rendered as HTML <li>s."
         forms = ' '.join(form.as_ul() for form in self)
-        return mark_safe('\n'.join([str(self.management_form), forms]))
+        return mark_safe(str(self.management_form) + '\n' + forms)
 
 
 def formset_factory(form, formset=BaseFormSet, extra=1, can_order=False,
@@ -423,18 +443,23 @@ def formset_factory(form, formset=BaseFormSet, extra=1, can_order=False,
     # limit is simply max_num + DEFAULT_MAX_NUM (which is 2*DEFAULT_MAX_NUM
     # if max_num is None in the first place)
     absolute_max = max_num + DEFAULT_MAX_NUM
-    attrs = {'form': form, 'extra': extra,
-             'can_order': can_order, 'can_delete': can_delete,
-             'min_num': min_num, 'max_num': max_num,
-             'absolute_max': absolute_max, 'validate_min': validate_min,
-             'validate_max': validate_max}
+    attrs = {
+        'form': form,
+        'extra': extra,
+        'can_order': can_order,
+        'can_delete': can_delete,
+        'min_num': min_num,
+        'max_num': max_num,
+        'absolute_max': absolute_max,
+        'validate_min': validate_min,
+        'validate_max': validate_max,
+    }
     return type(form.__name__ + 'FormSet', (formset,), attrs)
 
 
 def all_valid(formsets):
-    """Return True if every formset in formsets is valid."""
+    """Validate every formset and return True if all are valid."""
     valid = True
     for formset in formsets:
-        if not formset.is_valid():
-            valid = False
+        valid &= formset.is_valid()
     return valid

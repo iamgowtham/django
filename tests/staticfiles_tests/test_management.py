@@ -1,20 +1,22 @@
-import codecs
 import datetime
 import os
 import shutil
 import tempfile
 import unittest
 from io import StringIO
+from pathlib import Path
 from unittest import mock
 
 from admin_scripts.tests import AdminScriptTestCase
 
 from django.conf import settings
 from django.contrib.staticfiles import storage
-from django.contrib.staticfiles.management.commands import collectstatic
+from django.contrib.staticfiles.management.commands import (
+    collectstatic, runserver,
+)
 from django.core.exceptions import ImproperlyConfigured
-from django.core.management import call_command
-from django.test import override_settings
+from django.core.management import CommandError, call_command
+from django.test import RequestFactory, override_settings
 from django.test.utils import extend_sys_path
 from django.utils import timezone
 from django.utils._os import symlinks_supported
@@ -34,13 +36,34 @@ class TestNoFilesCreated:
         self.assertEqual(os.listdir(settings.STATIC_ROOT), [])
 
 
+class TestRunserver(StaticFilesTestCase):
+    @override_settings(MIDDLEWARE=['django.middleware.common.CommonMiddleware'])
+    def test_middleware_loaded_only_once(self):
+        command = runserver.Command()
+        with mock.patch('django.middleware.common.CommonMiddleware') as mocked:
+            command.get_handler(use_static_handler=True, insecure_serving=True)
+            self.assertEqual(mocked.call_count, 1)
+
+    def test_404_response(self):
+        command = runserver.Command()
+        handler = command.get_handler(use_static_handler=True, insecure_serving=True)
+        missing_static_file = os.path.join(settings.STATIC_URL, 'unknown.css')
+        req = RequestFactory().get(missing_static_file)
+        with override_settings(DEBUG=False):
+            response = handler.get_response(req)
+            self.assertEqual(response.status_code, 404)
+        with override_settings(DEBUG=True):
+            response = handler.get_response(req)
+            self.assertEqual(response.status_code, 404)
+
+
 class TestFindStatic(TestDefaults, CollectionTestCase):
     """
     Test ``findstatic`` management command.
     """
     def _get_file(self, filepath):
         path = call_command('findstatic', filepath, all=False, verbosity=0, stdout=StringIO())
-        with codecs.open(path, "r", "utf-8") as f:
+        with open(path, encoding='utf-8') as f:
             return f.read()
 
     def test_all_files(self):
@@ -80,6 +103,7 @@ class TestFindStatic(TestDefaults, CollectionTestCase):
         # FileSystemFinder searched locations
         self.assertIn(TEST_SETTINGS['STATICFILES_DIRS'][1][1], searched_locations)
         self.assertIn(TEST_SETTINGS['STATICFILES_DIRS'][0], searched_locations)
+        self.assertIn(str(TEST_SETTINGS['STATICFILES_DIRS'][2]), searched_locations)
         # DefaultStorageFinder searched locations
         self.assertIn(
             os.path.join('staticfiles_tests', 'project', 'site_media', 'media'),
@@ -151,6 +175,53 @@ class TestCollection(TestDefaults, CollectionTestCase):
         self.assertFileNotFound('test/.hidden')
         self.assertFileNotFound('test/backup~')
         self.assertFileNotFound('test/CVS')
+
+    def test_pathlib(self):
+        self.assertFileContains('pathlib.txt', 'pathlib')
+
+
+class TestCollectionPathLib(TestCollection):
+    def mkdtemp(self):
+        tmp_dir = super().mkdtemp()
+        return Path(tmp_dir)
+
+
+class TestCollectionVerbosity(CollectionTestCase):
+    copying_msg = 'Copying '
+    run_collectstatic_in_setUp = False
+    post_process_msg = 'Post-processed'
+    staticfiles_copied_msg = 'static files copied to'
+
+    def test_verbosity_0(self):
+        stdout = StringIO()
+        self.run_collectstatic(verbosity=0, stdout=stdout)
+        self.assertEqual(stdout.getvalue(), '')
+
+    def test_verbosity_1(self):
+        stdout = StringIO()
+        self.run_collectstatic(verbosity=1, stdout=stdout)
+        output = stdout.getvalue()
+        self.assertIn(self.staticfiles_copied_msg, output)
+        self.assertNotIn(self.copying_msg, output)
+
+    def test_verbosity_2(self):
+        stdout = StringIO()
+        self.run_collectstatic(verbosity=2, stdout=stdout)
+        output = stdout.getvalue()
+        self.assertIn(self.staticfiles_copied_msg, output)
+        self.assertIn(self.copying_msg, output)
+
+    @override_settings(STATICFILES_STORAGE='django.contrib.staticfiles.storage.ManifestStaticFilesStorage')
+    def test_verbosity_1_with_post_process(self):
+        stdout = StringIO()
+        self.run_collectstatic(verbosity=1, stdout=stdout, post_process=True)
+        self.assertNotIn(self.post_process_msg, stdout.getvalue())
+
+    @override_settings(STATICFILES_STORAGE='django.contrib.staticfiles.storage.ManifestStaticFilesStorage')
+    def test_verbosity_2_with_post_process(self):
+        stdout = StringIO()
+        self.run_collectstatic(verbosity=2, stdout=stdout, post_process=True)
+        self.assertIn(self.post_process_msg, stdout.getvalue())
 
 
 class TestCollectionClear(CollectionTestCase):
@@ -226,6 +297,12 @@ class TestInteractiveMessages(CollectionTestCase):
         self.assertNotIn(self.delete_warning_msg, output)
         self.assertIn(self.files_copied_msg, output)
 
+    def test_cancelled(self):
+        self.run_collectstatic()
+        with mock.patch('builtins.input', side_effect=lambda _: 'no'):
+            with self.assertRaisesMessage(CommandError, 'Collecting static files cancelled'):
+                call_command('collectstatic', interactive=True)
+
 
 class TestCollectionExcludeNoDefaultIgnore(TestDefaults, CollectionTestCase):
     """
@@ -252,11 +329,12 @@ class TestCollectionExcludeNoDefaultIgnore(TestDefaults, CollectionTestCase):
 class TestCollectionCustomIgnorePatterns(CollectionTestCase):
     def test_custom_ignore_patterns(self):
         """
-        A custom ignore_patterns list, ['*.css'] in this case, can be specified
-        in an AppConfig definition.
+        A custom ignore_patterns list, ['*.css', '*/vendor/*.js'] in this case,
+        can be specified in an AppConfig definition.
         """
         self.assertFileNotFound('test/nonascii.css')
         self.assertFileContains('test/.hidden', 'should be ignored')
+        self.assertFileNotFound(os.path.join('test', 'vendor', 'module.js'))
 
 
 class TestCollectionDryRun(TestNoFilesCreated, CollectionTestCase):
@@ -265,6 +343,11 @@ class TestCollectionDryRun(TestNoFilesCreated, CollectionTestCase):
     """
     def run_collectstatic(self):
         super().run_collectstatic(dry_run=True)
+
+
+@override_settings(STATICFILES_STORAGE='django.contrib.staticfiles.storage.ManifestStaticFilesStorage')
+class TestCollectionDryRunManifestStaticFilesStorage(TestCollectionDryRun):
+    pass
 
 
 class TestCollectionFilesOverride(CollectionTestCase):
@@ -302,7 +385,8 @@ class TestCollectionFilesOverride(CollectionTestCase):
         os.utime(self.testfile_path, (self.orig_atime - 1, self.orig_mtime - 1))
 
         self.settings_with_test_app = self.modify_settings(
-            INSTALLED_APPS={'prepend': 'staticfiles_test_app'})
+            INSTALLED_APPS={'prepend': 'staticfiles_test_app'},
+        )
         with extend_sys_path(self.temp_dir):
             self.settings_with_test_app.enable()
 
@@ -456,3 +540,8 @@ class TestCollectionLinks(TestDefaults, CollectionTestCase):
         os.symlink(nonexistent_file_path, broken_symlink_path)
         self.run_collectstatic(clear=True)
         self.assertFalse(os.path.lexists(broken_symlink_path))
+
+    @override_settings(STATICFILES_STORAGE='staticfiles_tests.storage.PathNotImplementedStorage')
+    def test_no_remote_link(self):
+        with self.assertRaisesMessage(CommandError, "Can't symlink to a remote destination."):
+            self.run_collectstatic()

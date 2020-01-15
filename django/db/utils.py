@@ -1,7 +1,8 @@
-import os
 import pkgutil
 from importlib import import_module
-from threading import local
+from pathlib import Path
+
+from asgiref.local import Local
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
@@ -82,12 +83,11 @@ class DatabaseErrorWrapper:
             db_exc_type = getattr(self.wrapper.Database, dj_exc_type.__name__)
             if issubclass(exc_type, db_exc_type):
                 dj_exc_value = dj_exc_type(*exc_value.args)
-                dj_exc_value.__cause__ = exc_value
                 # Only set the 'errors_occurred' flag for errors that may make
                 # the connection unusable.
                 if dj_exc_type not in (DataError, IntegrityError):
                     self.wrapper.errors_occurred = True
-                raise dj_exc_value.with_traceback(traceback)
+                raise dj_exc_value.with_traceback(traceback) from exc_value
 
     def __call__(self, func):
         # Note that we are intentionally not using @wraps here for performance
@@ -112,7 +112,7 @@ def load_backend(backend_name):
     except ImportError as e_user:
         # The database backend wasn't found. Display a helpful error message
         # listing all built-in database backends.
-        backend_dir = os.path.join(os.path.dirname(__file__), 'backends')
+        backend_dir = str(Path(__file__).parent / 'backends')
         builtin_backends = [
             name for _, name, ispkg in pkgutil.iter_modules([backend_dir])
             if ispkg and name not in {'base', 'dummy', 'postgresql_psycopg2'}
@@ -140,7 +140,12 @@ class ConnectionHandler:
         like settings.DATABASES).
         """
         self._databases = databases
-        self._connections = local()
+        # Connections needs to still be an actual thread local, as it's truly
+        # thread-critical. Database backends should use @async_unsafe to protect
+        # their code from async contexts, but this will give those contexts
+        # separate connections in case it's needed as well. There's no cleanup
+        # after async contexts, though, so we don't allow that if we can help it.
+        self._connections = Local(thread_critical=True)
 
     @cached_property
     def databases(self):
@@ -152,11 +157,10 @@ class ConnectionHandler:
                     'ENGINE': 'django.db.backends.dummy',
                 },
             }
+        if DEFAULT_DB_ALIAS not in self._databases:
+            raise ImproperlyConfigured("You must define a '%s' database." % DEFAULT_DB_ALIAS)
         if self._databases[DEFAULT_DB_ALIAS] == {}:
             self._databases[DEFAULT_DB_ALIAS]['ENGINE'] = 'django.db.backends.dummy'
-
-        if DEFAULT_DB_ALIAS not in self._databases:
-            raise ImproperlyConfigured("You must define a '%s' database" % DEFAULT_DB_ALIAS)
         return self._databases
 
     def ensure_defaults(self, alias):
@@ -190,8 +194,15 @@ class ConnectionHandler:
             raise ConnectionDoesNotExist("The connection %s doesn't exist" % alias)
 
         test_settings = conn.setdefault('TEST', {})
-        for key in ['CHARSET', 'COLLATION', 'NAME', 'MIRROR']:
-            test_settings.setdefault(key, None)
+        default_test_settings = [
+            ('CHARSET', None),
+            ('COLLATION', None),
+            ('MIGRATE', True),
+            ('MIRROR', None),
+            ('NAME', None),
+        ]
+        for key, value in default_test_settings:
+            test_settings.setdefault(key, value)
 
     def __getitem__(self, alias):
         if hasattr(self._connections, alias):

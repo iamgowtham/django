@@ -1,6 +1,7 @@
 """
 Tests for F() query expression syntax.
 """
+import uuid
 
 from django.db import models
 
@@ -14,6 +15,10 @@ class Employee(models.Model):
         return '%s %s' % (self.firstname, self.lastname)
 
 
+class RemoteEmployee(Employee):
+    adjusted_salary = models.IntegerField()
+
+
 class Company(models.Model):
     name = models.CharField(max_length=100)
     num_employees = models.PositiveIntegerField()
@@ -21,12 +26,15 @@ class Company(models.Model):
     ceo = models.ForeignKey(
         Employee,
         models.CASCADE,
-        related_name='company_ceo_set')
+        related_name='company_ceo_set',
+    )
     point_of_contact = models.ForeignKey(
         Employee,
         models.SET_NULL,
         related_name='company_point_of_contact_set',
-        null=True)
+        null=True,
+    )
+    based_in_eu = models.BooleanField(default=False)
 
     def __str__(self):
         return self.name
@@ -49,6 +57,7 @@ class Experiment(models.Model):
     end = models.DateTimeField()
 
     class Meta:
+        db_table = 'expressions_ExPeRiMeNt'
         ordering = ('name',)
 
     def duration(self):
@@ -79,8 +88,13 @@ class SimulationRun(models.Model):
         return "%s (%s to %s)" % (self.midpoint, self.start, self.end)
 
 
+class UUIDPK(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)
+
+
 class UUID(models.Model):
     uuid = models.UUIDField(null=True)
+    uuid_fk = models.ForeignKey(UUIDPK, models.CASCADE, null=True)
 
     def __str__(self):
         return "%s" % self.uuid
